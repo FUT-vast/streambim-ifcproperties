@@ -22,10 +22,34 @@
         <span class="caret" aria-hidden="true">▾</span>
       </button>
       <div id="picker-panel" class="picker-panel" hidden>
-        <input id="picker-filter" type="search" placeholder="Filtrera filer…" aria-label="Filtrera filer">
+        <div class="picker-search">
+          <input id="picker-filter" type="search" placeholder="Sök filnamn…" aria-label="Sök filnamn">
+          <button type="button" id="f-toggle" class="filter-btn" aria-expanded="false" aria-controls="f-panel">
+            Filter <span id="f-toggle-count" class="badge" hidden></span>
+          </button>
+        </div>
+        <div id="f-panel" class="filters" hidden>
+          <div class="filter-row">
+            <span class="filter-title">Senast ändrad</span>
+            <div class="dates">
+              <label>Nyare än <input id="f-newer" type="date"></label>
+              <label>Äldre än <input id="f-older" type="date"></label>
+            </div>
+          </div>
+          <div class="filter-row" id="f-layers-row">
+            <span class="filter-title">Lager</span>
+            <div id="f-layers" class="chips"></div>
+          </div>
+          <div class="filter-row" id="f-labels-row">
+            <span class="filter-title">Etiketter</span>
+            <div id="f-labels"></div>
+          </div>
+        </div>
         <div class="picker-tools">
-          <button type="button" id="pick-all" class="link">Markera alla</button>
-          <button type="button" id="pick-none" class="link">Rensa</button>
+          <button type="button" id="pick-all" class="link" title="Markera alla filer som syns i listan">Markera alla</button>
+          <button type="button" id="pick-none" class="link" title="Avmarkera alla filer som syns i listan">Avmarkera</button>
+          <button type="button" id="f-reset" class="link" hidden>Nollställ filter</button>
+          <span id="f-count" class="f-count"></span>
         </div>
         <ul id="picker-list" class="picker-list" role="listbox" aria-multiselectable="true"></ul>
       </div>
@@ -40,6 +64,11 @@
       <div class="toolbar">
         <input id="search" type="search" placeholder="Sök property set eller egenskap…" aria-label="Sök">
         <span id="summary" class="muted"></span>
+      </div>
+      <div id="markbar" class="markbar" hidden>
+        <span id="mark-text"></span>
+        <button type="button" id="mark-zoom" class="link" hidden>Zooma till</button>
+        <button type="button" id="mark-clear" class="link">Rensa markering</button>
       </div>
       <ul id="psets" class="psets"></ul>
     </div>

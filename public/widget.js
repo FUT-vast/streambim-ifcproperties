@@ -10,8 +10,8 @@
 
 const PAGE_SIZE = 1000;           // getObjectInfoForSearch default; larger pages with all columns can fail
 const MAX_VALUE_ROWS = 1000;      // rows rendered in the values table
+const MAX_INLINE_VALUES = 40;     // values joined with " | " next to a property name
 const ATTR = '';                  // internal key for columns without a property set
-const ATTR_LABEL = 'Objektattribut (utan property set)';
 const IGNORED_COLUMNS = new Set(['Link']); // synthetic viewer URL, not an IFC property
 const FILE_COLORS = ['#4077ce', '#f2921c', '#2f8f4e', '#9b4dca', '#d14343', '#0e8a96', '#8a6d3b', '#c2417f', '#5e677b', '#6b8e23'];
 
@@ -72,20 +72,17 @@ function fileTags(present) {
   return wrap;
 }
 
-// Pset keys are "name" or "origin\u0000name" (IfcProject/IfcSite, see SEP).
+// Pset keys are "origin\u0000name": origin is IfcProject, IfcSite or IfcElement (ordinary objects).
+// ATTR as name = the node's own attributes (Name, IFC Type …), not a property set.
+const ELEMENT = 'IfcElement';
 const psetOrigin = (pset) => (pset.includes('\u0000') ? pset.split('\u0000')[0] : '');
 const psetName = (pset) => (pset.includes('\u0000') ? pset.slice(pset.indexOf('\u0000') + 1) : pset);
-function psetLabel(pset) {
-  const name = psetName(pset);
-  if (name !== ATTR) return name;
-  return psetOrigin(pset) ? 'Attribut' : ATTR_LABEL;
-}
-// IfcProject first, then IfcSite, then object attributes, then the rest alphabetically.
+const isPropertySet = (pset) => psetName(pset) !== ATTR;
+const psetLabel = (pset) => (isPropertySet(pset) ? psetName(pset) : 'Attribut');
+// IfcProject, IfcSite, then IfcElement; within each, attributes first.
 function psetRank(pset) {
-  const origin = psetOrigin(pset);
-  if (origin === 'IfcProject') return 0;
-  if (origin === 'IfcSite') return 1;
-  return pset === ATTR ? 2 : 3;
+  const origin = { IfcProject: 0, IfcSite: 1 }[psetOrigin(pset)] ?? 2;
+  return origin * 2 + (isPropertySet(pset) ? 1 : 0);
 }
 
 function valueText(value) {
@@ -94,12 +91,18 @@ function valueText(value) {
   return String(value).trim();
 }
 
-// findObjects/searches occasionally reject a valid query with { code: "unknown" }: retry once.
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// findObjects/searches occasionally reject a valid query with { code: "unknown" }: retry once,
+// after a short pause (fair use: back off instead of retrying at once).
 async function retryOnce(fn) {
   try {
     return await fn();
   } catch (err) {
-    if (err && err.code === 'unknown') return fn();
+    if (err && err.code === 'unknown') {
+      await sleep(1000);
+      return fn();
+    }
     throw err;
   }
 }
@@ -137,12 +140,50 @@ async function loadFileList() {
   const unique = [...new Map(records.map((r) => [r.id, r])).values()];
   return Promise.all(unique.map(async (r) => {
     let name = `Dokument ${r.id}`;
+    let modified = null; // "last-modified" only (not the upload date)
+    let labels = [];
     try {
       const doc = await rest(`${base}/documents/${r.id}`);
-      if (doc?.data?.attributes?.filename) name = String(doc.data.attributes.filename);
+      const attrs = doc?.data?.attributes || {};
+      if (attrs.filename) name = String(attrs.filename);
+      const time = Date.parse(attrs['last-modified']);
+      if (Number.isFinite(time)) modified = new Date(time);
+      const rel = doc?.data?.relationships?.labels?.data;
+      if (Array.isArray(rel)) labels = rel.map((l) => String(l && l.id)).filter((id) => /^\d+$/.test(id));
     } catch { /* keep the fallback name */ }
-    return { ...r, name };
+    // "M~E" = assigned to sublayers M and E.
+    const layers = r.layer.split('~').map((s) => s.trim()).filter(Boolean);
+    return { ...r, name, modified, labels, layers };
   }));
+}
+
+// Document labels as in StreamBIM's document panel: id -> { id, name, group }.
+// Not essential: on failure the label filter is just left out.
+async function loadLabels() {
+  const base = `/project-${encodeURIComponent(projectId)}/api/v1/v2`;
+  const out = new Map();
+  try {
+    const res = await rest(`${base}/document-labels`);
+    for (const l of Array.isArray(res && res.data) ? res.data : []) {
+      if (l && l.id && l.attributes && l.attributes.name) out.set(String(l.id), { id: String(l.id), name: String(l.attributes.name), group: '' });
+    }
+  } catch (err) {
+    console.warn('Kunde inte hämta dokumentetiketter:', err);
+    return out;
+  }
+  try {
+    const res = await rest(`${base}/label-groups`);
+    for (const g of Array.isArray(res && res.data) ? res.data : []) {
+      const groupName = String(g?.attributes?.name ?? '');
+      for (const ref of g?.relationships?.labels?.data || []) {
+        const label = out.get(String(ref && ref.id));
+        if (label) label.group = groupName;
+      }
+    }
+  } catch (err) {
+    console.warn('Kunde inte hämta etikettgrupper:', err);
+  }
+  return out;
 }
 
 /* ---------- loading ---------- */
@@ -156,7 +197,7 @@ const EXPORT_PAGE_START = 1000;
 const EXPORT_PAGE_MIN = 50;
 const EXPORT_TIMEOUT_MS = 90000;
 const OBJECT_TIMEOUT_MS = 20000;
-const CONCURRENCY = 16;
+const CONCURRENCY = 4; // fair use: at most a few requests at a time
 
 function withTimeout(promise, ms, what) {
   let timer;
@@ -178,17 +219,22 @@ async function createSearch(rules) {
 }
 
 // Calls onRows(rows, header, objectsSoFar) for every page. Halves the page size on failure.
-async function exportAll(searchId, onRows) {
+// fields: optional column names (e.g. ['GUID']); without it every column is returned.
+async function exportAll(searchId, onRows, fields) {
   const base = `/project-${encodeURIComponent(projectId)}/api/v1/ifc-searches/export/json`;
+  const names = fields ? `&fieldNames=${encodeURIComponent(btoa(fields.join('|')))}` : '';
   let size = EXPORT_PAGE_START;
+  let retries = 0;
   for (let skip = 0; ;) {
     let res;
     try {
       res = await withTimeout(
-        rest(`${base}?searchId=${encodeURIComponent(searchId)}&fieldUnion=true&page[limit]=${size}&page[skip]=${skip}`),
+        rest(`${base}?searchId=${encodeURIComponent(searchId)}&fieldUnion=true${names}&page[limit]=${size}&page[skip]=${skip}`),
         EXPORT_TIMEOUT_MS, 'Exporten');
     } catch (err) {
       if (size <= EXPORT_PAGE_MIN) throw err;
+      // Back off before retrying with a smaller page: 1 s, 2 s, 4 s, 8 s …
+      await sleep(Math.min(8000, 1000 * 2 ** retries++));
       size = Math.max(EXPORT_PAGE_MIN, Math.floor(size / 2));
       continue;
     }
@@ -276,10 +322,36 @@ function spatialOrigin(kind) {
 }
 
 // All IfcProject/IfcSite objects in the building, loaded once:
-// { items: [{ guid, info, row }], error }. getObjectInfo (info) only has the node's own
-// attributes and tells which file it belongs to. The property sets (row) come from the REST
-// export, searched by GUID, like for ordinary objects.
+// { items: [{ guid, info, row }], error }. Neither getObjectInfo nor the search export carries
+// their property sets, so each node is read as a REST record:
+// GET /v2/ifc-objects/{guid}?building=… -> attributes.properties (own attributes, @Document Id)
+// and attributes.groups (property sets: [{ label, content: { properties: [{ key, value }] } }]).
 let spatialPromise = null;
+
+// Server-made groups: "Custom" holds created/updated by (user e-mails), "Geometry" is computed.
+// Neither is IFC data, and Custom must not be shown.
+const SKIP_GROUPS = new Set(['Custom', 'Geometry']);
+
+async function spatialRecord(guid) {
+  const path = `/project-${encodeURIComponent(projectId)}/api/v1/v2/ifc-objects/${encodeURIComponent(guid)}`
+    + `?building=${encodeURIComponent(buildingId)}`;
+  const res = await withTimeout(rest(path), OBJECT_TIMEOUT_MS, `Objekt ${guid}`);
+  const attrs = res && res.data && res.data.attributes;
+  if (!attrs) throw new Error('oväntat svar');
+  return attrs;
+}
+
+// REST record attributes -> row keyed like the export ("Pset~Prop", "IFC Type", …).
+function rowFromRecord(attrs) {
+  const row = rowFromInfo({ properties: attrs.properties });
+  for (const group of Array.isArray(attrs.groups) ? attrs.groups : []) {
+    const label = String((group && group.label) ?? '').replace(/:\s*$/, '').trim(); // "BaseQuantities:"
+    if (!label || SKIP_GROUPS.has(label)) continue;
+    const props = group.content && Array.isArray(group.content.properties) ? group.content.properties : [];
+    for (const p of props) if (p && p.key !== undefined) row[`${label}~${p.key}`] = p.value;
+  }
+  return row;
+}
 
 function loadSpatial() {
   if (spatialPromise) return spatialPromise;
@@ -294,6 +366,7 @@ function loadSpatial() {
     if (!kinds.length) kinds = ['Project', 'Site'];
 
     const out = [];
+    let error = null;
     for (const kind of kinds) {
       let guids = [];
       try {
@@ -305,27 +378,19 @@ function loadSpatial() {
       }
       await mapLimit(Array.isArray(guids) ? guids : [], CONCURRENCY, async (guid) => {
         try {
-          const info = await withTimeout(retryOnce(() => api.getObjectInfo(guid)), OBJECT_TIMEOUT_MS, `Objekt ${guid}`);
-          out.push({ guid, info });
-        } catch (err) {
-          console.warn(`Kunde inte läsa ${kind} ${guid}:`, err);
+          const attrs = await spatialRecord(guid);
+          out.push({ guid, info: { properties: attrs.properties || {} }, row: rowFromRecord(attrs) });
+        } catch (recordErr) {
+          // Without the record we still need to know the file, to report it as missing there.
+          error = recordErr;
+          try {
+            const info = await withTimeout(retryOnce(() => api.getObjectInfo(guid)), OBJECT_TIMEOUT_MS, `Objekt ${guid}`);
+            out.push({ guid, info, row: null });
+          } catch (err) {
+            console.warn(`Kunde inte läsa ${kind} ${guid}:`, err);
+          }
         }
       });
-    }
-    if (!out.length) return { items: out, error: null };
-
-    // Property sets of these nodes: one search (GUID = a OR GUID = b …), all columns.
-    let error = null;
-    try {
-      const byGuid = new Map();
-      const searchId = await createSearch(out.map(({ guid }) => [{ propKey: 'GUID', propValue: guid }]));
-      await exportAll(searchId, (rows) => {
-        for (const row of rows) if (row && row.GUID) byGuid.set(row.GUID, row);
-      });
-      for (const item of out) item.row = byGuid.get(item.guid) || null;
-      if (out.every((item) => !item.row)) error = new Error('exporten gav inga rader för dem');
-    } catch (err) {
-      error = err;
     }
     return { items: out, error };
   })();
@@ -345,11 +410,11 @@ function belongsToFile(info, file) {
 // FileData: { objects, psets: Map pset -> Map prop -> Map value -> count, skipped }
 async function fetchFile(file, onProgress) {
   const psets = new Map();
-  const column = (key, origin = '') => {
+  const column = (key, origin = ELEMENT) => {
     if (IGNORED_COLUMNS.has(key)) return null;
     const cut = key.indexOf('~');
     const name = cut > 0 ? key.slice(0, cut) : ATTR;
-    const pset = origin ? origin + SEP + name : name;
+    const pset = origin + SEP + name;
     const prop = cut > 0 ? key.slice(cut + 1) : key;
     if (!psets.has(pset)) psets.set(pset, new Map());
     const props = psets.get(pset);
@@ -359,12 +424,13 @@ async function fetchFile(file, onProgress) {
   const spatialSeen = new Set(); // GUIDs of IfcProject/IfcSite already counted
   const add = (row, guid, forcedOrigin) => {
     if (!row || typeof row !== 'object') return;
-    const origin = forcedOrigin || spatialOrigin(row['IFC Type']);
-    if (origin) {
+    const spatial = forcedOrigin || spatialOrigin(row['IFC Type']);
+    if (spatial) {
       const id = guid || row.GUID || row['Global Id'];
       if (id && spatialSeen.has(id)) return;
       if (id) spatialSeen.add(id);
     }
+    const origin = spatial || ELEMENT;
     for (const [key, raw] of Object.entries(row)) {
       const values = column(key, origin);
       const value = valueText(raw);
@@ -402,9 +468,9 @@ async function fetchFile(file, onProgress) {
       objects = n;
       progress(`läst ${nf.format(n)} objekt`);
     });
-    if (objects && [...psets.keys()].some((p) => p !== ATTR)) {
+    if (objects && [...psets.keys()].some(isPropertySet)) {
       const warning = await addSpatial();
-      return { objects, psets, skipped: 0, warning };
+      return { objects, psets, skipped: 0, warning, rule };
     }
     exportError = new Error(objects ? 'exporten gav inga property sets' : 'exporten gav inga objekt');
   } catch (err) {
@@ -431,11 +497,11 @@ async function fetchFile(file, onProgress) {
   if (skipped === guids.length) throw new Error(`Kunde inte läsa några objekt i ${file.name}. Exporten: ${errorText(exportError)}`);
   // getObjectInfo only has the objects' own attributes. Without property sets the result is not
   // what the widget promises, so say so instead of showing a partial list.
-  if (![...psets.keys()].some((p) => p !== ATTR)) {
+  if (![...psets.keys()].some(isPropertySet)) {
     throw new Error(`Kunde inte läsa property sets för ${file.name}. Exporten: ${errorText(exportError)}`);
   }
   const warning = await addSpatial();
-  return { objects: guids.length, psets, skipped, warning };
+  return { objects: guids.length, psets, skipped, warning, rule };
 }
 
 function loadFile(file, onProgress) {
@@ -451,6 +517,12 @@ function loadFile(file, onProgress) {
 async function refresh() {
   const token = ++loadToken;
   $('error').hidden = true;
+  // Marks are per file selection: drop them (and the highlight in the model) when it changes.
+  loadedData = [];
+  if (marks.size) {
+    marks.clear();
+    applyMarks();
+  }
   renderFiles(null);
   if (!selected.length) {
     merged = null;
@@ -483,6 +555,7 @@ async function refresh() {
   if (token !== loadToken) return; // the selection changed while loading
 
   $('progress').hidden = true;
+  loadedData = loaded;
   merged = mergeFiles(loaded);
   renderFiles(loaded);
   renderList();
@@ -513,23 +586,121 @@ function mergeFiles(loaded) {
 
 const isSelected = (file) => selected.some((f) => f.id === file.id);
 
+// File filters: free text, date range on "last-modified", layers (any of), labels (any of within a
+// label group, all groups must match).
+let labelsById = new Map();
+const fileFilter = { layers: new Set(), labels: new Set() };
+
+// "yyyy-mm-dd" from a date input -> local midnight, or null.
+function dayStart(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || '');
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
+}
+
+const fmtDate = (d) => (d ? d.toLocaleDateString('sv-SE') : '');
+
 function visibleFiles() {
   const q = $('picker-filter').value.trim().toLowerCase();
-  return files.filter((f) => f.name.toLowerCase().includes(q));
+  const newer = dayStart($('f-newer').value); // modified on or after this day
+  const older = dayStart($('f-older').value); // modified before this day
+
+  // Selected labels per group: a file must have at least one of each group's selected labels.
+  const byGroup = new Map();
+  for (const id of fileFilter.labels) {
+    const group = labelsById.get(id)?.group ?? '';
+    if (!byGroup.has(group)) byGroup.set(group, new Set());
+    byGroup.get(group).add(id);
+  }
+
+  return files.filter((f) => {
+    if (q && !f.name.toLowerCase().includes(q)) return false;
+    if ((newer || older) && !f.modified) return false;
+    if (newer && f.modified < newer) return false;
+    if (older && f.modified >= older) return false;
+    if (fileFilter.layers.size && !f.layers.some((l) => fileFilter.layers.has(l))) return false;
+    for (const ids of byGroup.values()) if (!f.labels.some((id) => ids.has(id))) return false;
+    return true;
+  });
+}
+
+function activeFilterCount() {
+  return ($('picker-filter').value.trim() ? 1 : 0) + ($('f-newer').value ? 1 : 0) + ($('f-older').value ? 1 : 0)
+    + fileFilter.layers.size + fileFilter.labels.size;
+}
+
+function chipToggle(text, on, onClick, title) {
+  const b = el('button', 'chip-toggle', text);
+  b.type = 'button';
+  b.setAttribute('aria-pressed', String(on));
+  if (title) b.title = title;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function toggleIn(set, value) {
+  if (set.has(value)) set.delete(value); else set.add(value);
+  renderFilters();
+  renderPicker();
+}
+
+// Layer and label chips: only values that occur on the project's IFC files.
+function renderFilters() {
+  const layers = [...new Set(files.flatMap((f) => f.layers))].sort(collator.compare);
+  $('f-layers-row').hidden = !layers.length;
+  $('f-layers').replaceChildren(...layers.map((l) =>
+    chipToggle(l, fileFilter.layers.has(l), () => toggleIn(fileFilter.layers, l))));
+
+  const used = new Set(files.flatMap((f) => f.labels));
+  const groups = new Map(); // group name -> labels
+  for (const id of used) {
+    const label = labelsById.get(id);
+    if (!label) continue;
+    if (!groups.has(label.group)) groups.set(label.group, []);
+    groups.get(label.group).push(label);
+  }
+  const groupNames = [...groups.keys()].sort((a, b) => (a === '') - (b === '') || collator.compare(a, b));
+  $('f-labels-row').hidden = !groupNames.length;
+  $('f-labels').replaceChildren(...groupNames.map((g) => {
+    const wrap = el('div', 'label-group');
+    wrap.append(el('span', 'label-group-name', g || 'Övriga'));
+    const chips = el('div', 'chips');
+    chips.append(...groups.get(g).sort((a, b) => collator.compare(a.name, b.name)).map((label) =>
+      chipToggle(label.name, fileFilter.labels.has(label.id), () => toggleIn(fileFilter.labels, label.id))));
+    wrap.append(chips);
+    return wrap;
+  }));
+
+  const n = activeFilterCount();
+  $('f-reset').hidden = !n;
+  $('f-toggle-count').textContent = n ? String(n) : '';
+  $('f-toggle-count').hidden = !n;
+}
+
+function resetFilters() {
+  $('picker-filter').value = '';
+  $('f-newer').value = '';
+  $('f-older').value = '';
+  fileFilter.layers.clear();
+  fileFilter.labels.clear();
+  renderFilters();
+  renderPicker();
 }
 
 function pickerOpen(open) {
   $('picker-panel').hidden = !open;
   $('picker-btn').setAttribute('aria-expanded', String(open));
   if (open) {
-    $('picker-filter').value = '';
+    renderFilters();
     renderPicker();
     $('picker-filter').focus();
   }
 }
 
 function renderPicker() {
-  const items = visibleFiles().map((file) => {
+  const visible = visibleFiles();
+  $('f-count').textContent = visible.length === files.length
+    ? `${files.length} filer` : `Visar ${visible.length} av ${files.length} filer`;
+  const items = visible.map((file) => {
     const li = el('li');
     li.setAttribute('role', 'option');
     li.setAttribute('aria-selected', String(isSelected(file)));
@@ -539,13 +710,16 @@ function renderPicker() {
     box.checked = isSelected(file);
     box.addEventListener('change', () => toggleFile(file, box.checked));
     const name = el('span', 'file-name', file.name);
+    const date = el('span', 'file-date', fmtDate(file.modified));
     const layer = el('span', 'file-layer', file.layer);
-    label.title = `${file.name}\nLager: ${file.layer} · dokument ${file.id}`;
-    label.append(box, name, layer);
+    const labelNames = file.labels.map((id) => labelsById.get(id)?.name).filter(Boolean);
+    label.title = [file.name, `Senast ändrad: ${fmtDate(file.modified) || 'okänt'}`, `Lager: ${file.layer}`,
+      labelNames.length ? `Etiketter: ${labelNames.join(', ')}` : '', `Dokument ${file.id}`].filter(Boolean).join('\n');
+    label.append(box, name, date, layer);
     li.append(label);
     return li;
   });
-  if (!items.length) items.push(el('li', 'none', files.length ? 'Inga filer matchar.' : 'Inga IFC-filer i projektet.'));
+  if (!items.length) items.push(el('li', 'none', files.length ? 'Inga filer matchar filtren.' : 'Inga IFC-filer i projektet.'));
   $('picker-list').replaceChildren(...items);
 }
 
@@ -610,10 +784,26 @@ function presentIn(prop) {
   return new Set(prop.files.keys());
 }
 
-function uniqueCount(prop) {
-  const all = new Set();
-  for (const values of prop.files.values()) for (const v of values.keys()) all.add(v);
-  return all.size;
+// [value, total count] over the selected files, most common first.
+function sortedValues(prop) {
+  const totals = new Map();
+  for (const values of prop.files.values()) {
+    for (const [v, c] of values) totals.set(v, (totals.get(v) || 0) + c);
+  }
+  return [...totals].sort((a, b) => b[1] - a[1] || collator.compare(a[0], b[0]));
+}
+
+const ORIGIN_TITLES = {
+  IfcProject: 'Ligger på IfcProject',
+  IfcSite: 'Ligger på IfcSite',
+  IfcElement: 'Ligger på objekt i modellen (byggdelar, rum m.m.)',
+};
+
+function originChip(pset) {
+  const origin = psetOrigin(pset);
+  const chip = el('span', origin === ELEMENT ? 'origin origin-element' : 'origin', origin);
+  chip.title = ORIGIN_TITLES[origin] || '';
+  return chip;
 }
 
 function renderList() {
@@ -644,12 +834,7 @@ function renderList() {
     btn.type = 'button';
     btn.setAttribute('aria-expanded', String(Boolean(open)));
     const label = el('span', 'label');
-    if (psetOrigin(pset)) {
-      const chip = el('span', 'origin', psetOrigin(pset));
-      chip.title = `Property set kopplat till ${psetOrigin(pset)}, inte till byggdelar`;
-      label.append(chip);
-    }
-    label.append(highlight(psetLabel(pset), q));
+    label.append(originChip(pset), highlight(psetLabel(pset), q));
     btn.append(el('span', 'chev', '▸'), label, fileTags(present),
       el('span', 'meta', propNames.length === 1 ? '1 egenskap' : `${propNames.length} egenskaper`));
     btn.addEventListener('click', () => {
@@ -659,19 +844,37 @@ function renderList() {
     li.append(btn);
 
     if (open) {
+      // Two columns: property name (click = mark in the model) and its values joined with " | ".
       const ul = el('ul', 'props');
       for (const name of propNames) {
         const prop = props.get(name);
-        const n = uniqueCount(prop);
-        const pbtn = el('button', 'prop-btn');
-        pbtn.type = 'button';
-        pbtn.title = 'Visa unika värden';
-        const plabel = el('span', 'label');
-        plabel.append(highlight(name, q));
-        pbtn.append(plabel, fileTags(presentIn(prop)), el('span', 'meta', n === 1 ? '1 värde' : `${nf.format(n)} värden`), el('span', 'open-hint', '›'));
-        pbtn.addEventListener('click', () => openValues(pset, name));
-        const pli = el('li');
-        pli.append(pbtn);
+        const values = sortedValues(prop);
+        const pli = el('li', isMarked(pset, name) ? 'prop-row marked' : 'prop-row');
+
+        // Only modelled objects can be marked in the viewer.
+        let nameBtn;
+        if (canMark(pset)) {
+          nameBtn = el('button', 'prop-name');
+          nameBtn.type = 'button';
+          nameBtn.title = 'Markera alla objekt med egenskapen i de valda filerna (klicka igen för att avmarkera)';
+          nameBtn.setAttribute('aria-pressed', String(isMarked(pset, name)));
+          nameBtn.addEventListener('click', () => toggleMark(pset, name));
+        } else {
+          nameBtn = el('span', 'prop-name static');
+        }
+        nameBtn.append(highlight(name, q));
+
+        const shown = values.slice(0, MAX_INLINE_VALUES).map(([v]) => v);
+        const text = shown.join(' | ') + (values.length > shown.length ? ' | …' : '');
+        const valuesCell = el('span', 'prop-values', text || '–');
+        valuesCell.title = text;
+
+        const countBtn = el('button', 'prop-count', values.length === 1 ? '1 värde ›' : `${nf.format(values.length)} värden ›`);
+        countBtn.type = 'button';
+        countBtn.title = 'Visa alla värden';
+        countBtn.addEventListener('click', () => openValues(pset, name));
+
+        pli.append(nameBtn, valuesCell, fileTags(presentIn(prop)), countBtn);
         ul.append(pli);
       }
       li.append(ul);
@@ -687,7 +890,7 @@ function renderList() {
 
 function openValues(pset, prop) {
   openProp = { pset, prop };
-  $('sheet-kicker').textContent = [psetOrigin(pset), psetLabel(pset)].filter(Boolean).join(' · ');
+  $('sheet-kicker').textContent = `${psetOrigin(pset)} · ${psetLabel(pset)}`;
   $('sheet-title').textContent = prop;
   $('value-search').value = '';
   renderValues();
@@ -733,10 +936,22 @@ function renderValues() {
   head.append(el('th', 'num', multi ? 'Totalt' : 'Antal objekt'));
   $('values-head').replaceChildren(head);
 
+  const { pset, prop: propName } = openProp;
   const body = rows.slice(0, MAX_VALUE_ROWS).map(([value, counts]) => {
-    const tr = el('tr');
+    const marked = isMarked(pset, propName, value);
+    const tr = el('tr', marked ? 'marked' : '');
     const td = el('td', 'value');
-    td.append(highlight(value, q));
+    if (canMark(pset)) {
+      const btn = el('button', 'value-btn');
+      btn.type = 'button';
+      btn.title = 'Markera objekten med det här värdet i de valda filerna (klicka igen för att avmarkera)';
+      btn.setAttribute('aria-pressed', String(marked));
+      btn.append(highlight(value, q));
+      btn.addEventListener('click', () => toggleMark(pset, propName, value));
+      td.append(btn);
+    } else {
+      td.append(highlight(value, q));
+    }
     tr.append(td);
     if (multi) {
       counts.forEach((c, idx) => {
@@ -763,14 +978,168 @@ function renderValues() {
   note.textContent = `Visar de ${nf.format(MAX_VALUE_ROWS)} vanligaste av ${nf.format(rows.length)} värden. Filtrera för att hitta fler.`;
 }
 
+/* ---------- marking objects in the model ---------- */
+
+// Each mark is a property (all objects that have it) or a property + value, in the selected files.
+// Only modelled objects (IfcElement psets/attributes); IfcProject/IfcSite are not marked.
+// Marks are OR-ed. Flow:
+// 1. REST search (POST ifc-searches) with the rules: answers with an error instead of hanging,
+//    unlike the widget's findObjects/applyObjectSearch on a search the server does not accept.
+// 2. Export only the GUID column of that search: the matching objects and their count.
+// 3. Show them in StreamBIM: applyObjectSearch (the viewer's own search highlight) with the same
+//    rules. If it does not answer, colour the GUIDs with colorCodeObjects (search colour).
+const marks = new Map(); // key -> { pset, prop, value }
+let loadedData = [];     // FileData of the selected files, same order as `selected`
+let markToken = 0;
+let colouredByGuid = false; // colorCodeObjects fallback in use: clear it on reset
+// colorCodeObjects needs a colour, but in the default flavour it is not drawn: the objects are
+// isolated as a search and shown in the search-highlight green (see AGENTS.md, Traps).
+const MARK_COLOUR = 'f2921c';
+const APPLY_TIMEOUT_MS = 15000;
+const MARK_DEBOUNCE_MS = 400; // several quick clicks -> one search
+
+const markKey = (pset, prop, value) => JSON.stringify([pset, prop, value === undefined ? null : value]);
+const isMarked = (pset, prop, value) => marks.has(markKey(pset, prop, value));
+const canMark = (pset) => psetOrigin(pset) === ELEMENT;
+
+function toggleMark(pset, prop, value) {
+  if (!canMark(pset)) return;
+  const key = markKey(pset, prop, value);
+  if (marks.has(key)) marks.delete(key); else marks.set(key, { pset, prop, value });
+  renderList();
+  renderValues();
+  scheduleMarks();
+}
+
+function clearMarks() {
+  if (!marks.size) return;
+  marks.clear();
+  renderList();
+  renderValues();
+  scheduleMarks();
+}
+
+// Fair use: wait for a pause in the clicking, then run one search for all marks.
+let markTimer = null;
+function scheduleMarks() {
+  markToken += 1; // results of a search still running are now outdated
+  clearTimeout(markTimer);
+  if (marks.size) setMarkBar(`${marks.size === 1 ? '1 markering' : `${marks.size} markeringar`} · …`);
+  markTimer = setTimeout(applyMarks, MARK_DEBOUNCE_MS);
+}
+
+async function zoomToMarked() {
+  try {
+    await withTimeout(api.zoomToSearchResult(), OBJECT_TIMEOUT_MS, 'Zoomningen');
+  } catch (err) {
+    console.warn(err);
+  }
+}
+
+// Search rule for one mark (without the file part). "hasValue" is sent without propValue, as
+// valuesForObjectProperty does.
+function propertyRule({ pset, prop, value }) {
+  let rule;
+  if (isPropertySet(pset)) rule = { psetName: psetName(pset), propKey: prop };
+  else rule = { propKey: prop === 'IFC Type' ? '@kind' : prop }; // export column -> search key
+  return value === undefined
+    ? { ...rule, operator: 'hasValue' }
+    : { ...rule, operator: '=', propValue: value };
+}
+
+// Rule[][] without buildingId (createSearch adds it).
+function markRules() {
+  const rules = [];
+  for (const mark of marks.values()) {
+    for (const data of loadedData) {
+      if (data && data.rule) rules.push([data.rule, propertyRule(mark)]);
+    }
+  }
+  return rules;
+}
+
+function setMarkBar(text, { canZoom = false } = {}) {
+  $('markbar').hidden = !marks.size;
+  $('mark-text').textContent = text;
+  $('mark-zoom').hidden = !canZoom;
+}
+
+async function clearViewer() {
+  try { await withTimeout(api.resetObjectSearch(), OBJECT_TIMEOUT_MS, 'Återställningen'); } catch (err) { console.warn(err); }
+  if (colouredByGuid) {
+    colouredByGuid = false;
+    try { await withTimeout(api.colorCodeObjects({}), OBJECT_TIMEOUT_MS, 'Återställningen'); } catch (err) { console.warn(err); }
+  }
+}
+
+async function applyMarks() {
+  const token = ++markToken;
+  if (!marks.size) {
+    setMarkBar('');
+    await clearViewer();
+    return;
+  }
+  const what = marks.size === 1 ? '1 markering' : `${marks.size} markeringar`;
+  const started = Date.now();
+  const status = (text) => {
+    if (token === markToken) setMarkBar(`${what} · ${text} (${Math.round((Date.now() - started) / 1000)} s)`);
+  };
+  status('söker i modellen');
+  const rules = markRules();
+  try {
+    const searchId = await createSearch(rules);
+    const guids = [];
+    await exportAll(searchId, (rows, header, n) => {
+      for (const row of rows) if (row && row.GUID) guids.push(String(row.GUID));
+      status(`hittat ${nf.format(n)} objekt`);
+    }, ['GUID']);
+    if (token !== markToken) return;
+
+    await clearViewer();
+    if (token !== markToken) return;
+    if (!guids.length) {
+      setMarkBar(`${what} · inga objekt i modellen matchar`);
+      return;
+    }
+
+    status(`markerar ${nf.format(guids.length)} objekt`);
+    let how = 'sökmarkering';
+    try {
+      const withBuilding = rules.map((and) => and.map((r) => ({ buildingId, ...r })));
+      await withTimeout(api.applyObjectSearch({ rules: withBuilding }), APPLY_TIMEOUT_MS, 'applyObjectSearch');
+    } catch (err) {
+      console.warn('applyObjectSearch svarade inte, färgar objekten i stället:', err);
+      if (token !== markToken) return;
+      await withTimeout(api.colorCodeObjects(Object.fromEntries(guids.map((g) => [g, MARK_COLOUR]))),
+        EXPORT_TIMEOUT_MS, 'Färgningen');
+      colouredByGuid = true;
+      how = 'färgade';
+    }
+    if (token === markToken) setMarkBar(`${what} · ${nf.format(guids.length)} objekt markerade (${how})`, { canZoom: how === 'sökmarkering' });
+  } catch (err) {
+    if (token === markToken) setMarkBar(`${what} · kunde inte markera: ${errorText(err)}`);
+  }
+}
+
 /* ---------- events ---------- */
 
+$('mark-clear').addEventListener('click', clearMarks);
+$('mark-zoom').addEventListener('click', zoomToMarked);
+
 $('picker-btn').addEventListener('click', () => pickerOpen($('picker-panel').hidden));
-$('picker-filter').addEventListener('input', renderPicker);
+$('picker-filter').addEventListener('input', () => { renderFilters(); renderPicker(); });
+for (const id of ['f-newer', 'f-older']) $(id).addEventListener('change', () => { renderFilters(); renderPicker(); });
+$('f-reset').addEventListener('click', resetFilters);
+$('f-toggle').addEventListener('click', () => {
+  const open = $('f-panel').hidden;
+  $('f-panel').hidden = !open;
+  $('f-toggle').setAttribute('aria-expanded', String(open));
+});
 $('pick-all').addEventListener('click', () => setAll(true));
 $('pick-none').addEventListener('click', () => setAll(false));
 document.addEventListener('click', (e) => {
-  if (!$('picker-panel').hidden && !$('picker').contains(e.target)) pickerOpen(false);
+  // composedPath: the clicked chip may already be re-rendered (detached) when this runs.
+  if (!$('picker-panel').hidden && !e.composedPath().includes($('picker'))) pickerOpen(false);
 });
 $('search').addEventListener('input', renderList);
 $('value-search').addEventListener('input', renderValues);
@@ -793,10 +1162,13 @@ async function start(remote, mode) {
   setStatus(mode === 'mock' ? 'Testdata' : `Projekt ${projectId}`, mode);
   $('picker-label').textContent = 'Hämtar filer…';
   // Only .ifc files (the building can also hold point clouds, DWG, XML …).
-  files = (await loadFileList())
+  const [fileList, labels] = await Promise.all([loadFileList(), loadLabels()]);
+  files = fileList
     .filter((f) => /\.ifc$/i.test(f.name.trim()))
     .sort((a, b) => collator.compare(a.name, b.name));
+  labelsById = labels;
   $('picker-btn').disabled = false;
+  renderFilters();
   renderPickerLabel();
 }
 

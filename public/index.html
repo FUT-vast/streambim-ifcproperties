@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IFC-egenskaper</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="kicker">StreamBIM</p>
+      <h1>IFC-egenskaper</h1>
+    </div>
+    <span id="status" class="status">Ansluter…</span>
+  </header>
+
+  <main class="app">
+    <div class="picker" id="picker">
+      <button type="button" id="picker-btn" class="picker-btn" aria-haspopup="listbox" aria-expanded="false" disabled>
+        <span id="picker-label" class="picker-label">Välj IFC-filer…</span>
+        <span class="caret" aria-hidden="true">▾</span>
+      </button>
+      <div id="picker-panel" class="picker-panel" hidden>
+        <input id="picker-filter" type="search" placeholder="Filtrera filer…" aria-label="Filtrera filer">
+        <div class="picker-tools">
+          <button type="button" id="pick-all" class="link">Markera alla</button>
+          <button type="button" id="pick-none" class="link">Rensa</button>
+        </div>
+        <ul id="picker-list" class="picker-list" role="listbox" aria-multiselectable="true"></ul>
+      </div>
+    </div>
+
+    <ul id="files" class="files" hidden></ul>
+
+    <p id="progress" class="progress" hidden></p>
+    <p id="error" class="error" hidden></p>
+
+    <div id="result" hidden>
+      <div class="toolbar">
+        <input id="search" type="search" placeholder="Sök property set eller egenskap…" aria-label="Sök">
+        <span id="summary" class="muted"></span>
+      </div>
+      <ul id="psets" class="psets"></ul>
+    </div>
+
+    <p id="empty" class="empty">Välj en eller flera IFC-filer ovan för att se deras property sets.</p>
+  </main>
+
+  <div id="sheet" class="sheet" hidden>
+    <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+      <header>
+        <div class="sheet-head">
+          <p id="sheet-kicker" class="sheet-kicker"></p>
+          <h2 id="sheet-title"></h2>
+        </div>
+        <button type="button" id="sheet-close" class="ghost icon" title="Stäng" aria-label="Stäng">✕</button>
+      </header>
+      <div class="sheet-body">
+        <div class="toolbar">
+          <input id="value-search" type="search" placeholder="Filtrera värden…" aria-label="Filtrera värden">
+          <span id="value-summary" class="muted"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="values">
+            <thead id="values-head"></thead>
+            <tbody id="values-body"></tbody>
+          </table>
+        </div>
+        <p id="value-note" class="muted small" hidden></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- penpal v7 (StreamBIM's widget protocol), pinned with Subresource Integrity -->
+  <script src="https://cdn.jsdelivr.net/npm/penpal@7.0.6/dist/penpal.min.js"
+          integrity="sha384-3WRKbvXu1eTbdyJl2Tmp5aVQdQM9FMF9S3bIPtZjz4kF8dNQ5h8xwPcl1uDD5suv"
+          crossorigin="anonymous"></script>
+  <script src="mock.js"></script>
+  <script src="widget.js"></script>
+</body>
+</html>

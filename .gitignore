@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Secrets and local config: never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.*
+credentials*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
